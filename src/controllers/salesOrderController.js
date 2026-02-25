@@ -44,166 +44,6 @@ function parsePositiveInt(value) {
   return parsed;
 }
 
-function extractLineProductRefs(line) {
-  return {
-    productVariantId: parsePositiveInt(
-      line?.product_variant_id ?? line?.product_product_id
-    ),
-    productId: parsePositiveInt(line?.product_id),
-    productTemplateId: parsePositiveInt(
-      line?.product_template_id ?? line?.product_tmpl_id
-    ),
-  };
-}
-
-async function resolveSalesOrderLineProductIds(uid, lines) {
-  const refs = lines.map((line) => extractLineProductRefs(line));
-
-  const variantProbeIds = [
-    ...new Set(
-      refs
-        .flatMap((ref) => [ref.productVariantId, ref.productId])
-        .filter((id) => id !== null)
-    ),
-  ];
-
-  let variantIds = new Set();
-  if (variantProbeIds.length) {
-    const variantLookup = await callOdoo({
-      jsonrpc: "2.0",
-      method: "call",
-      params: {
-        service: "object",
-        method: "execute_kw",
-        args: [
-          DB,
-          uid,
-          PASSWORD,
-          "product.product",
-          "search_read",
-          [[["id", "in", variantProbeIds]]],
-          { fields: ["id"], limit: variantProbeIds.length },
-        ],
-      },
-      id: Date.now(),
-    });
-
-    if (variantLookup.error) {
-      return { error: variantLookup.error };
-    }
-
-    variantIds = new Set(
-      (variantLookup.result ?? [])
-        .map((variant) => parsePositiveInt(variant.id))
-        .filter((id) => id !== null)
-    );
-  }
-
-  const templateProbeIds = [
-    ...new Set(
-      refs
-        .flatMap((ref) => [
-          ref.productTemplateId,
-          ref.productId && !variantIds.has(ref.productId) ? ref.productId : null,
-        ])
-        .filter((id) => id !== null)
-    ),
-  ];
-
-  let templateToVariant = new Map();
-  if (templateProbeIds.length) {
-    const templateVariantLookup = await callOdoo({
-      jsonrpc: "2.0",
-      method: "call",
-      params: {
-        service: "object",
-        method: "execute_kw",
-        args: [
-          DB,
-          uid,
-          PASSWORD,
-          "product.product",
-          "search_read",
-          [[["product_tmpl_id", "in", templateProbeIds]]],
-          {
-            fields: ["id", "product_tmpl_id"],
-            limit: Math.max(100, templateProbeIds.length * 10),
-          },
-        ],
-      },
-      id: Date.now(),
-    });
-
-    if (templateVariantLookup.error) {
-      return { error: templateVariantLookup.error };
-    }
-
-    templateToVariant = new Map();
-    for (const variant of templateVariantLookup.result ?? []) {
-      const templateId = parsePositiveInt(variant?.product_tmpl_id?.[0]);
-      const variantId = parsePositiveInt(variant?.id);
-      if (!templateId || !variantId || templateToVariant.has(templateId)) continue;
-      templateToVariant.set(templateId, variantId);
-    }
-  }
-
-  const normalizedLines = [];
-  const unresolved = [];
-  for (const [index, line] of lines.entries()) {
-    const ref = refs[index];
-    let resolvedProductId = null;
-    let unresolvedField = "";
-    let unresolvedValue = null;
-
-    if (ref.productVariantId) {
-      if (variantIds.has(ref.productVariantId)) {
-        resolvedProductId = ref.productVariantId;
-      } else {
-        unresolvedField = "product_variant_id";
-        unresolvedValue = ref.productVariantId;
-      }
-    } else if (ref.productId) {
-      if (variantIds.has(ref.productId)) {
-        resolvedProductId = ref.productId;
-      } else if (templateToVariant.has(ref.productId)) {
-        resolvedProductId = templateToVariant.get(ref.productId);
-      } else {
-        unresolvedField = "product_id";
-        unresolvedValue = ref.productId;
-      }
-    } else if (ref.productTemplateId) {
-      if (templateToVariant.has(ref.productTemplateId)) {
-        resolvedProductId = templateToVariant.get(ref.productTemplateId);
-      } else {
-        unresolvedField = "product_template_id";
-        unresolvedValue = ref.productTemplateId;
-      }
-    } else {
-      unresolvedField = "product_id";
-      unresolvedValue = null;
-    }
-
-    if (!resolvedProductId) {
-      unresolved.push({
-        line: index + 1,
-        field: unresolvedField,
-        value: unresolvedValue,
-      });
-      continue;
-    }
-
-    normalizedLines.push({
-      ...line,
-      product_id: resolvedProductId,
-    });
-  }
-
-  return {
-    lines: normalizedLines,
-    unresolved,
-  };
-}
-
 export async function getSalesOrderFields(req, res) {
   const uid = await authOdoo();
   if (!uid) return res.status(401).json({ error: "Auth failed" });
@@ -583,35 +423,26 @@ export async function createSalesOrder(req, res) {
     if (!uid) return res.status(401).json({ error: "Auth failed" });
 
     const input = req.body;
+    const salespersonId = parsePositiveInt(
+      input.salesperson_id ??
+        input.salesperson?.id ??
+        (Array.isArray(input.user_id) ? input.user_id[0] : input.user_id)
+    );
 
-    let normalizedLines;
-    if (Array.isArray(input.lines)) {
-      const resolved = await resolveSalesOrderLineProductIds(uid, input.lines);
-      if (resolved.error) {
-        return res.status(400).json({ error: resolved.error });
-      }
-
-      if (resolved.unresolved.length) {
-        return res.status(400).json({
-          error:
-            "Invalid line product references. Pass a valid product variant id in product_id, or a valid product template id in product_template_id.",
-          details: resolved.unresolved,
-        });
-      }
-
-      normalizedLines = resolved.lines.map((line) => [
-        0,
-        0,
-        {
-          product_id: line.product_id,
-          product_uom_qty: line.quantity ?? 1,
-          price_unit: line.price_unit ?? 0,
-          name: line.description || line.name || "Line",
-          tax_id: line.tax_id,
-          discount: line.discount,
-        },
-      ]);
-    }
+    const normalizedLines = Array.isArray(input.lines)
+      ? input.lines.map((line) => [
+          0,
+          0,
+          {
+            product_id: line.product_id,
+            product_uom_qty: line.quantity ?? 1,
+            price_unit: line.price_unit ?? 0,
+            name: line.description || line.name || "Line",
+            tax_id: line.tax_id,
+            discount: line.discount,
+          },
+        ])
+      : undefined;
 
     const data = {
       partner_id: input.partner_id,
@@ -620,7 +451,7 @@ export async function createSalesOrder(req, res) {
       date_order: input.date_order,
       validity_date: input.validity_date,
       commitment_date: input.commitment_date,
-      user_id: input.user_id,
+      user_id: salespersonId,
       currency_id: input.currency_id,
       client_order_ref: input.client_order_ref,
       origin: input.origin,
