@@ -44,6 +44,238 @@ function parsePositiveInt(value) {
   return parsed;
 }
 
+function hasOwn(source, key) {
+  return Object.prototype.hasOwnProperty.call(source, key);
+}
+
+function parseBooleanLike(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function extractLineId(line) {
+  return parsePositiveInt(line?.id ?? line?.line_id ?? line?.order_line_id);
+}
+
+function extractLineProductRefs(line) {
+  return {
+    productVariantId: parsePositiveInt(
+      line?.product_variant_id ?? line?.product_product_id
+    ),
+    productId: parsePositiveInt(line?.product_id),
+    productTemplateId: parsePositiveInt(
+      line?.product_template_id ?? line?.product_tmpl_id
+    ),
+  };
+}
+
+function hasAnyLineProductReference(ref) {
+  return !!(ref.productVariantId || ref.productId || ref.productTemplateId);
+}
+
+async function resolveLineProductIds(uid, lines, { requireProduct = false } = {}) {
+  const refs = lines.map((line) => extractLineProductRefs(line));
+
+  const variantProbeIds = [
+    ...new Set(
+      refs
+        .flatMap((ref) => [ref.productVariantId, ref.productId])
+        .filter((id) => id !== null)
+    ),
+  ];
+
+  let variantIds = new Set();
+  if (variantProbeIds.length) {
+    const variantLookup = await callOdoo({
+      jsonrpc: "2.0",
+      method: "call",
+      params: {
+        service: "object",
+        method: "execute_kw",
+        args: [
+          DB,
+          uid,
+          PASSWORD,
+          "product.product",
+          "search_read",
+          [[["id", "in", variantProbeIds]]],
+          { fields: ["id"], limit: variantProbeIds.length },
+        ],
+      },
+      id: Date.now(),
+    });
+
+    if (variantLookup.error) return { error: variantLookup.error };
+
+    variantIds = new Set(
+      (variantLookup.result ?? [])
+        .map((variant) => parsePositiveInt(variant?.id))
+        .filter((id) => id !== null)
+    );
+  }
+
+  const templateProbeIds = [
+    ...new Set(
+      refs
+        .flatMap((ref) => [
+          ref.productTemplateId,
+          ref.productId && !variantIds.has(ref.productId) ? ref.productId : null,
+        ])
+        .filter((id) => id !== null)
+    ),
+  ];
+
+  let templateToVariant = new Map();
+  if (templateProbeIds.length) {
+    const templateVariantLookup = await callOdoo({
+      jsonrpc: "2.0",
+      method: "call",
+      params: {
+        service: "object",
+        method: "execute_kw",
+        args: [
+          DB,
+          uid,
+          PASSWORD,
+          "product.product",
+          "search_read",
+          [[["product_tmpl_id", "in", templateProbeIds]]],
+          {
+            fields: ["id", "product_tmpl_id"],
+            limit: Math.max(100, templateProbeIds.length * 10),
+          },
+        ],
+      },
+      id: Date.now(),
+    });
+
+    if (templateVariantLookup.error) return { error: templateVariantLookup.error };
+
+    for (const variant of templateVariantLookup.result ?? []) {
+      const templateId = parsePositiveInt(variant?.product_tmpl_id?.[0]);
+      const variantId = parsePositiveInt(variant?.id);
+      if (!templateId || !variantId || templateToVariant.has(templateId)) continue;
+      templateToVariant.set(templateId, variantId);
+    }
+  }
+
+  const resolvedLines = [];
+  const unresolved = [];
+
+  for (const [index, line] of lines.entries()) {
+    const ref = refs[index];
+    const resolvedLine = { ...line };
+    let resolvedProductId = null;
+    let unresolvedField = "";
+    let unresolvedValue = null;
+
+    if (ref.productVariantId) {
+      if (variantIds.has(ref.productVariantId)) {
+        resolvedProductId = ref.productVariantId;
+      } else {
+        unresolvedField = "product_variant_id";
+        unresolvedValue = ref.productVariantId;
+      }
+    } else if (ref.productId) {
+      if (variantIds.has(ref.productId)) {
+        resolvedProductId = ref.productId;
+      } else if (templateToVariant.has(ref.productId)) {
+        resolvedProductId = templateToVariant.get(ref.productId);
+      } else {
+        unresolvedField = "product_id";
+        unresolvedValue = ref.productId;
+      }
+    } else if (ref.productTemplateId) {
+      if (templateToVariant.has(ref.productTemplateId)) {
+        resolvedProductId = templateToVariant.get(ref.productTemplateId);
+      } else {
+        unresolvedField = "product_template_id";
+        unresolvedValue = ref.productTemplateId;
+      }
+    } else if (requireProduct) {
+      unresolvedField = "product_id";
+      unresolvedValue = null;
+    }
+
+    if (!resolvedProductId && unresolvedField) {
+      unresolved.push({
+        line: index + 1,
+        field: unresolvedField,
+        value: unresolvedValue,
+      });
+    }
+
+    if (resolvedProductId) {
+      resolvedLine.__resolved_product_id = resolvedProductId;
+    } else if (hasAnyLineProductReference(ref)) {
+      resolvedLine.__resolved_product_id = null;
+    }
+
+    resolvedLines.push(resolvedLine);
+  }
+
+  return {
+    lines: resolvedLines,
+    unresolved,
+  };
+}
+
+function buildSalesOrderLineValues(line, { isCreate = false } = {}) {
+  const values = {};
+
+  if (line.__resolved_product_id) values.product_id = line.__resolved_product_id;
+
+  if (hasOwn(line, "quantity")) values.product_uom_qty = line.quantity;
+  else if (isCreate) values.product_uom_qty = 1;
+
+  if (hasOwn(line, "price_unit")) values.price_unit = line.price_unit;
+  else if (isCreate) values.price_unit = 0;
+
+  const hasDescription = hasOwn(line, "description");
+  const hasName = hasOwn(line, "name");
+  if (hasDescription || hasName) {
+    values.name = line.description ?? line.name ?? "Line";
+  } else if (isCreate) {
+    values.name = "Line";
+  }
+
+  if (hasOwn(line, "tax_id")) values.tax_id = line.tax_id;
+  if (hasOwn(line, "discount")) values.discount = line.discount;
+
+  return values;
+}
+
+async function findSalesOrderByIdentifier(uid, rawId, fields = SALES_ORDER_FIELDS) {
+  const isNumericId = /^\d+$/.test(rawId);
+  const domain = isNumericId ? [["id", "=", Number(rawId)]] : [["name", "=", rawId]];
+
+  const lookup = await callOdoo({
+    jsonrpc: "2.0",
+    method: "call",
+    params: {
+      service: "object",
+      method: "execute_kw",
+      args: [
+        DB,
+        uid,
+        PASSWORD,
+        "sale.order",
+        "search_read",
+        [domain],
+        { fields, limit: 1 },
+      ],
+    },
+    id: Date.now(),
+  });
+
+  if (lookup.error) return { error: lookup.error };
+  return { result: lookup.result?.[0] || null };
+}
+
 export async function getSalesOrderFields(req, res) {
   const uid = await authOdoo();
   if (!uid) return res.status(401).json({ error: "Auth failed" });
@@ -417,32 +649,305 @@ export async function downloadSalesOrderPdf(req, res) {
   }
 }
 
+export async function updateSalesOrder(req, res) {
+  try {
+    const uid = await authOdoo();
+    if (!uid) return res.status(401).json({ error: "Auth failed" });
+
+    const rawId = String(req.params.id || "").trim();
+    if (!rawId) {
+      return res.status(400).json({ error: "Missing sales order identifier" });
+    }
+
+    const input = req.body || {};
+    if (hasOwn(input, "order_line") && hasOwn(input, "lines")) {
+      return res.status(400).json({
+        error: "Pass either 'lines' or 'order_line', not both.",
+      });
+    }
+
+    const lookup = await findSalesOrderByIdentifier(uid, rawId, [
+      "id",
+      "name",
+      "order_line",
+      "validity_date",
+      "client_order_ref",
+      "user_id",
+    ]);
+    if (lookup.error) {
+      return res.status(400).json({ error: lookup.error });
+    }
+
+    const salesOrder = lookup.result;
+    if (!salesOrder) {
+      return res.status(404).json({ error: "Sales order not found" });
+    }
+
+    const updateData = {};
+
+    if (hasOwn(input, "validity_date")) {
+      updateData.validity_date = input.validity_date;
+    }
+    if (hasOwn(input, "client_order_ref")) {
+      updateData.client_order_ref = input.client_order_ref;
+    }
+
+    const salespersonRequested =
+      hasOwn(input, "salesperson_id") ||
+      hasOwn(input, "salesperson") ||
+      hasOwn(input, "user_id");
+    const salespersonId = parsePositiveInt(
+      input.salesperson_id ??
+        input.salesperson?.id ??
+        (Array.isArray(input.user_id) ? input.user_id[0] : input.user_id)
+    );
+    if (salespersonRequested && !salespersonId) {
+      return res.status(400).json({
+        error:
+          "Invalid salesperson. Pass a positive integer in salesperson_id (or user_id).",
+      });
+    }
+    if (salespersonId) updateData.user_id = salespersonId;
+
+    if (hasOwn(input, "order_line")) {
+      if (!Array.isArray(input.order_line)) {
+        return res
+          .status(400)
+          .json({ error: "Invalid order_line. Expected an array of Odoo commands." });
+      }
+      updateData.order_line = input.order_line;
+    } else if (hasOwn(input, "lines")) {
+      if (!Array.isArray(input.lines)) {
+        return res.status(400).json({ error: "Invalid lines. Expected an array." });
+      }
+
+      const resolved = await resolveLineProductIds(uid, input.lines, {
+        requireProduct: false,
+      });
+      if (resolved.error) {
+        return res.status(400).json({ error: resolved.error });
+      }
+      if (resolved.unresolved.length) {
+        return res.status(400).json({
+          error:
+            "Invalid line product references. Use a valid product variant id in product_id, or a valid product template id in product_template_id.",
+          details: resolved.unresolved,
+        });
+      }
+
+      const existingLineIds = new Set(
+        (salesOrder.order_line || [])
+          .map((lineId) => parsePositiveInt(lineId))
+          .filter((lineId) => lineId !== null)
+      );
+
+      const lineCommands = [];
+      const invalidLineOps = [];
+
+      for (const [index, line] of resolved.lines.entries()) {
+        const lineId = extractLineId(line);
+        const wantsDelete = parseBooleanLike(
+          line?.delete ?? line?._delete ?? line?.remove ?? line?.is_deleted,
+          false
+        );
+
+        if (wantsDelete) {
+          if (!lineId) {
+            invalidLineOps.push({
+              line: index + 1,
+              error: "Delete requires line id (id/line_id/order_line_id).",
+            });
+            continue;
+          }
+          if (!existingLineIds.has(lineId)) {
+            invalidLineOps.push({
+              line: index + 1,
+              id: lineId,
+              error: "Line id does not belong to this sales order.",
+            });
+            continue;
+          }
+          lineCommands.push([2, lineId, 0]);
+          continue;
+        }
+
+        const values = buildSalesOrderLineValues(line, { isCreate: !lineId });
+        if (lineId) {
+          if (!existingLineIds.has(lineId)) {
+            invalidLineOps.push({
+              line: index + 1,
+              id: lineId,
+              error: "Line id does not belong to this sales order.",
+            });
+            continue;
+          }
+
+          if (Object.keys(values).length) {
+            lineCommands.push([1, lineId, values]);
+          }
+          continue;
+        }
+
+        if (!Object.keys(values).length) {
+          invalidLineOps.push({
+            line: index + 1,
+            error:
+              "No fields to create line. Provide product_id/product_template_id and/or editable line fields.",
+          });
+          continue;
+        }
+
+        lineCommands.push([0, 0, values]);
+      }
+
+      if (invalidLineOps.length) {
+        return res.status(400).json({
+          error: "Invalid line operations in lines payload.",
+          details: invalidLineOps,
+        });
+      }
+
+      if (lineCommands.length) {
+        updateData.order_line = lineCommands;
+      }
+    }
+
+    if (!Object.keys(updateData).length) {
+      return res.status(400).json({
+        error:
+          "No valid fields to update. Pass validity_date, client_order_ref, salesperson_id/user_id, and/or lines.",
+      });
+    }
+
+    const updated = await callOdoo({
+      jsonrpc: "2.0",
+      method: "call",
+      params: {
+        service: "object",
+        method: "execute_kw",
+        args: [DB, uid, PASSWORD, "sale.order", "write", [[salesOrder.id], updateData]],
+      },
+      id: Date.now(),
+    });
+
+    if (updated.error) {
+      return res.status(400).json({ error: updated.error });
+    }
+
+    const refreshed = await findSalesOrderByIdentifier(
+      uid,
+      String(salesOrder.id),
+      SALES_ORDER_FIELDS
+    );
+    if (refreshed.error) {
+      return res.status(400).json({ error: refreshed.error });
+    }
+
+    const refreshedOrder = refreshed.result;
+    const refreshedLineIds = (refreshedOrder?.order_line || [])
+      .map((lineId) => parsePositiveInt(lineId))
+      .filter((lineId) => lineId !== null);
+
+    let lines = [];
+    if (refreshedLineIds.length) {
+      const lineDetails = await callOdoo({
+        jsonrpc: "2.0",
+        method: "call",
+        params: {
+          service: "object",
+          method: "execute_kw",
+          args: [
+            DB,
+            uid,
+            PASSWORD,
+            "sale.order.line",
+            "search_read",
+            [[["id", "in", refreshedLineIds]]],
+            {
+              fields: [
+                "id",
+                "name",
+                "product_id",
+                "product_uom_qty",
+                "price_unit",
+                "discount",
+                "tax_id",
+                "price_subtotal",
+                "price_total",
+              ],
+              limit: refreshedLineIds.length,
+            },
+          ],
+        },
+        id: Date.now(),
+      });
+
+      if (!lineDetails.error) {
+        lines = lineDetails.result || [];
+      }
+    }
+
+    res.json({
+      success: true,
+      updated: true,
+      sales_order_id: salesOrder.id,
+      sales_order: refreshedOrder,
+      lines,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
 export async function createSalesOrder(req, res) {
   try {
     const uid = await authOdoo();
     if (!uid) return res.status(401).json({ error: "Auth failed" });
 
-    const input = req.body;
+    const input = req.body || {};
+    const salespersonRequested =
+      hasOwn(input, "salesperson_id") ||
+      hasOwn(input, "salesperson") ||
+      hasOwn(input, "user_id");
     const salespersonId = parsePositiveInt(
       input.salesperson_id ??
         input.salesperson?.id ??
         (Array.isArray(input.user_id) ? input.user_id[0] : input.user_id)
     );
 
-    const normalizedLines = Array.isArray(input.lines)
-      ? input.lines.map((line) => [
-          0,
-          0,
-          {
-            product_id: line.product_id,
-            product_uom_qty: line.quantity ?? 1,
-            price_unit: line.price_unit ?? 0,
-            name: line.description || line.name || "Line",
-            tax_id: line.tax_id,
-            discount: line.discount,
-          },
-        ])
-      : undefined;
+    if (salespersonRequested && !salespersonId) {
+      return res.status(400).json({
+        error:
+          "Invalid salesperson. Pass a positive integer in salesperson_id (or user_id).",
+      });
+    }
+
+    if (hasOwn(input, "lines") && !Array.isArray(input.lines)) {
+      return res.status(400).json({ error: "Invalid lines. Expected an array." });
+    }
+
+    let normalizedLines;
+    if (Array.isArray(input.lines)) {
+      const resolved = await resolveLineProductIds(uid, input.lines, {
+        requireProduct: false,
+      });
+      if (resolved.error) {
+        return res.status(400).json({ error: resolved.error });
+      }
+      if (resolved.unresolved.length) {
+        return res.status(400).json({
+          error:
+            "Invalid line product references. Use a valid product variant id in product_id, or a valid product template id in product_template_id.",
+          details: resolved.unresolved,
+        });
+      }
+
+      normalizedLines = resolved.lines.map((line) => [
+        0,
+        0,
+        buildSalesOrderLineValues(line, { isCreate: true }),
+      ]);
+    }
 
     const data = {
       partner_id: input.partner_id,
